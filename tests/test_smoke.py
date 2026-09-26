@@ -4,7 +4,11 @@ The focus is the Starlette 1.x / Pydantic 2.13 / bcrypt 5 migration surface, not
 the pre-existing correctness and auth issues catalogued in the upgrade plan.
 """
 
-import zipfile
+import shutil
+
+import pytest
+
+from helpers import auth_header, create_user
 
 
 def test_status(client):
@@ -114,31 +118,34 @@ def test_qr_generation(client, tmp_path, monkeypatch):
     assert res.headers["content-type"] == "image/jpeg"
 
 
-def test_backup(client, admin_token, mm_delegate):
-    """Exercises the backup itself.
+needs_pg_dump = pytest.mark.skipif(
+    shutil.which("pg_dump") is None, reason="pg_dump is not installed"
+)
 
-    The `/backup` route is a thin FileResponse over a path it rebuilds inline
-    rather than reading `database.db_zip`, so it cannot be pointed at a temp dir
-    from here. In production both resolve to backups/backup_db.zip, so the
-    interesting logic is `database.backup_database()`.
-    """
-    import sqlite3
+
+@needs_pg_dump
+def test_backup_requires_admin(client, tmp_path, monkeypatch):
+    import asyncio
 
     import database
 
-    database.backup_database()
+    monkeypatch.setattr(database, "BACKUP_DIR", str(tmp_path))
+    email = asyncio.run(create_user())
+    res = client.get("/backup", headers=auth_header(email))
+    assert res.status_code == 403
+    assert not list(tmp_path.iterdir())
 
-    with zipfile.ZipFile(database.db_zip) as z:
-        assert set(z.namelist()) == {"backup.db", "mm_backup.db"}
 
-    # the backup must be a readable database holding the seeded rows
-    with sqlite3.connect(database.backup_db) as conn:
-        assert conn.execute("SELECT count(*) FROM delegates").fetchone()[0] >= 1
-    with sqlite3.connect(database.mm_backup_db) as conn:
-        rows = conn.execute(
-            "SELECT id FROM mm_delegates WHERE id = ?", (mm_delegate.id,)
-        ).fetchall()
-        assert rows
+@needs_pg_dump
+def test_backup_returns_a_pg_dump(client, admin_token, mm_delegate, tmp_path, monkeypatch):
+    """The endpoint runs pg_dump and returns the custom-format dump ("PGDMP" magic)."""
+    import database
+
+    monkeypatch.setattr(database, "BACKUP_DIR", str(tmp_path))
+    res = client.get("/backup", headers={"Authorization": f"Bearer {admin_token}"})
+    assert res.status_code == 200
+    assert res.content.startswith(b"PGDMP")
+    assert len(list(tmp_path.glob("mundra-ondemand-*.dump"))) == 1
 
 
 # --- slowapi + Starlette 1.x ------------------------------------------------

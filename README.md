@@ -13,40 +13,56 @@ This backend is used by the Delego app available at
 
 ## Setup
 
-Dependencies are managed with [uv](https://docs.astral.sh/uv/). `pyproject.toml` and
-`uv.lock` are the source of truth; `requirements.txt` is a generated export kept for
-hosts that do not run uv.
+You need [uv](https://docs.astral.sh/uv/) and [Docker](https://www.docker.com/products/docker-desktop/)
+(Docker Desktop on macOS or Windows, Docker Engine on Linux). `pyproject.toml` and `uv.lock`
+are the source of truth for dependencies.
 
-1. Clone the repository:
+1. Clone the repository and install the dependencies (creates `.venv` with the locked versions):
 
 ```bash
 git clone https://github.com/munsoc-mpstme/mundra
 cd mundra
-```
-
-2. Install the dependencies (creates `.venv` and installs the locked versions):
-
-```bash
 uv sync
 ```
 
-3. Create your `.env`:
+> If `uv` says Python 3.11 is incompatible, an environment variable named `UV_PYTHON` is
+> overriding the project's `.python-version`. Run `unset UV_PYTHON`, or
+> `export UV_PYTHON=3.12` for the current terminal.
+
+2. Create your `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Then fill in the two required values:
+Then fill in the three required values:
 
-- `SECRET_KEY` — generate one with
+- `POSTGRES_PASSWORD` - the password for the Postgres database. Pick anything for local
+  development. Set it before the first `docker compose up`; changing it later does not
+  change an existing database.
+- `SECRET_KEY` - generate one with
   `uv run python -c "import secrets; print(secrets.token_urlsafe(48))"`
-- `MAIL_SERVER` — set to `localhost` for local development. The SMTP connection is only
+- `MAIL_SERVER` - set to `localhost` for local development. The SMTP connection is only
   opened when an email is actually sent, so every route except `/register` and
-  `/forgot_password` works without a real mail server.
+  `/forgot_password` works without a real mail server. (`/register` still creates the
+  account before it fails to send the email.)
+
+If something else on your machine already uses port 5432 (for example a Homebrew
+Postgres), also set `POSTGRES_PORT=5433` (or any free port) in `.env`.
 
 > **Note:** an empty value is not the same as an absent one. `DOCS_URL=` is read as the
 > empty string and *overrides* the default rather than falling back to it, which silently
 > disables that documentation route. Omit a key entirely if you want its default.
+
+3. Start Postgres and create the tables:
+
+```bash
+docker compose up -d db
+uv run alembic upgrade head
+```
+
+The database listens on `127.0.0.1` only, so it is reachable from your machine but not
+from the network. Its data lives in the `pgdata` Docker volume and survives restarts.
 
 4. Run the development server:
 
@@ -54,27 +70,77 @@ Then fill in the two required values:
 uv run fastapi dev app.py
 ```
 
-The SQLite databases under `databases/` are created automatically on first start.
+The API is at http://localhost:8000 and the documentation at http://localhost:8000/docs.
+
+To run the whole stack in containers instead (the app applies pending migrations on
+start):
+
+```bash
+docker compose up -d --build
+```
+
+### Creating the first admin
+
+Admins are ordinary users with the `admin` role. There is no route that creates the
+first one, because someone has to be trusted before any route can be.
+
+1. Register the account: `POST /register` with `firstname`, `lastname`, `email` and
+   `password`. Without a real mail server this returns a 500 because the verification
+   email cannot be sent, but the account is created.
+2. Verify the email. Click the link in the email, or in local development skip it with
+   `curl -X POST "http://localhost:8000/manual_verify?email=you@example.com"`.
+3. Give the account the admin role, on the machine that runs the app:
+
+```bash
+uv run python database.py make-admin you@example.com
+# in Docker: docker compose exec app python database.py make-admin you@example.com
+```
+
+From then on, admins manage roles with `PATCH /admin/users/{email}/role`
+(body: `{"role": "delegate" | "oc" | "admin"}`). Every change is recorded in the
+`admin_audit` table. You cannot change your own role.
 
 ### Running the tests
 
 ```bash
+docker compose up -d db
 uv run pytest
 ```
 
-The suite runs against a temporary database and does not touch `databases/`.
+The suite needs Postgres running and `POSTGRES_PASSWORD` set in `.env`. It creates a
+separate database called `mundra_test` (dropping any previous one) and applies the
+Alembic migrations to it, so it never touches your real data. The `GET /backup` tests are
+skipped if `pg_dump` is not installed.
 
-### Regenerating `requirements.txt`
+### Changing the schema
+
+Tables are defined in `db.py`. After changing them, generate and apply a migration:
 
 ```bash
-uv export --no-hashes --no-dev --no-annotate --format requirements-txt -o requirements.txt
+uv run alembic revision --autogenerate -m "describe the change"
+uv run alembic upgrade head
 ```
+
+Read the generated file in `alembic/versions/` before applying it.
+
+### Backups
+
+The `backup` service in `docker-compose.yml` writes a `pg_dump` into `./backups` every 24
+hours and deletes dumps older than 14 days. `GET /backup` (admin only) takes a dump on
+demand, returns it, and keeps a copy in `./backups` too (so the same cleanup applies).
+Restore with `pg_restore --clean --dbname <url> <file>`. Copy `./backups` off the machine
+as well; a backup on the same disk does not survive the disk.
+
+On a Linux server, `./backups` and `./qrcodes` must be writable by the container's `app`
+user (uid 1000), otherwise `GET /backup` and `GET /qr` fail with a permission error.
+`sudo chown -R 1000:1000 backups qrcodes` fixes it. Docker Desktop on macOS and Windows
+does not have this problem.
 
 ## Backend Documentation
 
 ### Overview
 
-This backend is built with FastAPI to handle authentication, delegate management, and MUN event operations. It uses SQLite for persistent storage and includes key features such as:
+This backend is built with FastAPI to handle authentication, delegate management, and MUN event operations. It uses PostgreSQL for persistent storage and includes key features such as:
 
  - User registration and login
  - Email verification and password reset
@@ -88,12 +154,15 @@ This backend is built with FastAPI to handle authentication, delegate management
  - **app.py**: Main entry point containing routes for auth, delegate actions, and admin tasks.
  - **auth.py**: Handles JWT-based authentication (creation/verification of tokens) and password hashing.
  - **config.py**: Pydantic-settings `Settings` model, loaded from `.env`.
- - **database.py**: Interacts with the SQLite databases (main and mm).
- - **models.py**: Defines pydantic models for Admin, Delegate, User, etc.
+ - **db.py**: The async SQLAlchemy engine and the table classes (`DelegateRow`, `UserRow`, ...).
+ - **database.py**: Query functions. They return pydantic models, never table rows.
+ - **models.py**: Pydantic models for the API (Delegate, User, ...).
+ - **alembic/**: Database migrations. `alembic.ini` and `alembic/env.py` read the connection from `.env`.
+ - **docker-compose.yml**, **Dockerfile**: The app, Postgres and the scheduled backup.
  - **mails.py**: Sends email via FastMail (for verification and password reset).
  - **templates/**: HTML templates for pages like password reset, food selection, and QR scanning.
  - **data/**: JSON content served by the app (`rooms.json`, `schedule.json`).
- - **tests/**: Smoke tests covering the unauthenticated routes, templates and admin flow.
+ - **tests/**: Smoke, database and role tests, run against a real Postgres.
  - **utils.py**: Contains helper functions, such as QR code generation.
 
 ## Key Endpoints
@@ -112,9 +181,10 @@ This backend is built with FastAPI to handle authentication, delegate management
 ### Admin Routes
 
  1. `GET /hash_password`: Hashes the provided password (utility).
- 2. `GET /backup`: Backs up main and MM databases into a zip.
+ 2. `GET /backup`: Runs `pg_dump` and returns the dump (admin only).
  3. `GET /delegates`: Lists all delegates in JSON or CSV (admin only).
  4. `POST /manual_verify`: Manually verify delegate email.
+ 5. `PATCH /admin/users/{email}/role`: Set a user's role (admin only, audited).
 
 ### Delegate Routes
 
@@ -138,13 +208,17 @@ This backend is built with FastAPI to handle authentication, delegate management
  - Uses JWT with a secret key.
  - Passwords are hashed with bcrypt.
  - Many routes are protected by Depends(get_current_user) to verify tokens.
- - Admin endpoints only accessible to the Admin model, enforced at runtime.
+ - Every user has a role (`delegate`, `oc` or `admin`). It is read from the database on
+   each request, not from the token, so a demotion applies immediately.
+ - Admin endpoints use `Depends(require_admin)`.
 
 ## Database Interactions
- - SQLite is used.
- - database.py has functions to add, get, update, and delete user/delegate data.
- - A second DB (mm.db) stores Mumbai MUN delegates.
- - Backups are created as zipped copies of both DBs.
+ - PostgreSQL 16 with async SQLAlchemy 2.0 (asyncpg); the schema is managed by Alembic.
+ - database.py has async functions to add, get, update, and delete user/delegate data.
+ - A Mumbai MUN delegate is a delegate plus a row in `mm_delegates` (country, committee,
+   meals), joined on the delegate id.
+ - Past MUN experience is stored one row per entry in `mun_experiences`.
+ - Backups are `pg_dump` files (see Backups above).
 
 ## API Usage
  - Send requests with Authorization: Bearer <token> to protected endpoints.

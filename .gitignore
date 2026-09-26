@@ -15,15 +15,12 @@ __pycache__/
 .ruff_cache/
 
 # Runtime artifacts
-databases/*
 backups/*
 qrcodes/*
-*.db
-*.zip
 
 # Local notes - not part of the repo
 COMPREHENSIVE_README.md
-
+CONTEXT.md
 # OS / editor
 .DS_Store
 .idea/

@@ -13,7 +13,7 @@ VERIFICATION_TOKEN_EXPIRE_MINUTES = settings.verification_token_expire_minutes
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> models.Delegate | models.Admin:
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> models.AuthUser:
     credentials_exception = HTTPException(
         status_code=403,
         detail="Could not validate credentials",
@@ -26,15 +26,28 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> models.Delega
             raise credentials_exception
     except InvalidTokenError:
         raise credentials_exception
-    admin = database.get_admin_by_email(email)
-    if admin:
-        return admin
-    delegate = database.get_delegate_by_email(email)
-    if not delegate:
+    # The role is read from the database on every request, not from the token, so a
+    # demotion or a deleted account takes effect immediately.
+    user = await database.get_auth_user(email)
+    if not user:
         raise credentials_exception
-    if not delegate.verified:
+    if not user.verified:
         raise HTTPException(status_code=401, detail="Please verify your email!")
-    return delegate
+    return user
+
+
+def require_role(*roles: str):
+    """Dependency that only lets users with one of the given roles through."""
+
+    async def dependency(user: models.AuthUser = Depends(get_current_user)) -> models.AuthUser:
+        if user.role not in roles:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return user
+
+    return dependency
+
+
+require_admin = require_role("admin")
 
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()
@@ -71,7 +84,7 @@ async def check_verification_token(token: str = Depends(oauth2_scheme)) -> model
         raise HTTPException(status_code=401, detail="Verification token expired")
     except InvalidTokenError:
         raise credentials_exception
-    delegate = database.get_delegate_by_email(email)
+    delegate = await database.get_delegate_by_email(email)
     if not delegate:
         raise credentials_exception
     return delegate
