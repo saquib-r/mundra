@@ -1,4 +1,8 @@
+from typing import Literal
+
 from pydantic import BaseModel, EmailStr, field_validator
+
+Role = Literal["delegate", "oc", "admin"]
 
 
 class Token(BaseModel):
@@ -8,11 +12,6 @@ class Token(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: str
-
-
-class Admin(BaseModel):
-    email: EmailStr
-    password: str
 
 
 class MunExperience(BaseModel):
@@ -36,6 +35,16 @@ class newDelegate(BaseModel):
 
 class Delegate(newDelegate):
     id: str
+
+
+class AuthUser(Delegate):
+    """The authenticated caller: their delegate profile plus their role."""
+
+    role: Role = "delegate"
+
+
+class RoleChange(BaseModel):
+    role: Role
 
 
 class User(BaseModel):

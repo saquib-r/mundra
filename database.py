@@ -1,124 +1,93 @@
-import os
-import sqlite3
-import zipfile
+"""Query functions. Table classes and the engine live in db.py; request/response
+shapes live in models.py. Every function opens its own short-lived session and
+returns Pydantic models, never ORM rows."""
 
+import argparse
+import asyncio
+import os
+from datetime import datetime, timezone
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import contains_eager, selectinload
+
+import config
+import db
 import models
 
-db = os.path.join(os.path.dirname(__file__), "databases", "main.db")
-backup_db = os.path.join(os.path.dirname(__file__), "backups", "backup.db")
-# MUMBAI MUN STUFF
-mm_db = os.path.join(os.path.dirname(__file__), "databases", "mm.db")
-mm_backup_db = os.path.join(os.path.dirname(__file__), "backups", "mm_backup.db")
+BACKUP_DIR = os.path.join(os.path.dirname(__file__), "backups")
 
-db_zip = os.path.join(os.path.dirname(__file__), "backups", "backup_db.zip")
-
-
-def init_admins():
-    try:
-        with sqlite3.connect(db) as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                """CREATE TABLE IF NOT EXISTS admins
-                (email TEXT PRIMARY KEY NOT NULL,
-                password TEXT NOT NULL)"""
-            )
-            connection.commit()
-            print("Database initialized successfully")
-    except sqlite3.Error as e:
-        print("Error initializing database:", e)
-
-
-def init_users():
-    try:
-        with sqlite3.connect(db) as connection:
-            cursor = connection.cursor()
-            cursor.execute("PRAGMA foreign_keys = ON")
-            cursor.execute(
-                """CREATE TABLE IF NOT EXISTS users
-                (email TEXT PRIMARY KEY NOT NULL,
-                password TEXT NOT NULL,
-                FOREIGN KEY(email) REFERENCES delegates(email) ON UPDATE CASCADE ON DELETE CASCADE)"""
-            )
-            connection.commit()
-            print("Database initialized successfully")
-    except sqlite3.Error as e:
-        print("Error initializing database:", e)
-
-
-def init_delegates():
-    try:
-        with sqlite3.connect(db) as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                """CREATE TABLE IF NOT EXISTS delegates
-                (id TEXT PRIMARY KEY NOT NULL,
-                firstname TEXT NOT NULL,
-                lastname TEXT NOT NULL,
-                email TEXT NOT NULL,
-                contact TEXT,
-                dateofbirth TEXT,
-                gender TEXT,
-                pastmuns TEXT,
-                verified BOOLEAN DEFAULT 0)"""
-            )
-            connection.commit()
-            print("Database initialized successfully")
-    except sqlite3.Error as e:
-        print("Error initializing database:", e)
-
-
-def init_mm_delegates():
-    try:
-        with sqlite3.connect(mm_db) as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                """CREATE TABLE IF NOT EXISTS mm_delegates(id TEXT PRIMARY KEY NOT NULL,
-                firstname TEXT NOT NULL,
-                lastname TEXT NOT NULL,
-                email TEXT NOT NULL,
-                contact TEXT,
-                dateofbirth TEXT,
-                gender TEXT,
-                pastmuns TEXT,
-                verified BOOLEAN DEFAULT 0,
-                country TEXT,
-                committee TEXT,
-                d1_bf BOOLEAN DEFAULT 1,
-                d1_lunch BOOLEAN DEFAULT 0,
-                d1_hitea BOOLEAN DEFAULT 0,
-                d2_bf BOOLEAN DEFAULT 0,
-                d2_lunch BOOLEAN DEFAULT 0,
-                d2_hitea BOOLEAN DEFAULT 0,
-                d3_bf BOOLEAN DEFAULT 0,
-                d3_lunch BOOLEAN DEFAULT 0,
-                d3_hitea BOOLEAN DEFAULT 0
-                )"""
-            )
-            connection.commit()
-            print("Database initialized successfully")
-    except sqlite3.Error as e:
-        print("Error initializing database:", e)
-
-
-def init():
-    init_admins()
-    init_users()
-    init_delegates()
-    init_mm_delegates()
+MEAL_FIELDS = tuple(f"d{day}_{meal}" for day in (1, 2, 3) for meal in ("bf", "lunch", "hitea"))
 
 
 ####################
-# ADMINS
+# ROW <-> MODEL MAPPING
 ####################
-def get_admin_by_email(email: str) -> models.Admin | None:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM admins WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if row:
-            return models.Admin(email=row[0], password=row[1])
-        else:
-            return None
+
+
+def _experience_rows(experiences: list[models.MunExperience]) -> list[db.MunExperienceRow]:
+    return [
+        db.MunExperienceRow(
+            position=position,
+            name=mun.name,
+            committee=mun.committee,
+            delegation=mun.delegation,
+            year=mun.year,
+            award=mun.award,
+        )
+        for position, mun in enumerate(experiences)
+    ]
+
+
+def _delegate_fields(row: db.DelegateRow) -> dict:
+    """Needs row.experiences loaded."""
+    return dict(
+        id=row.id,
+        firstname=row.firstname,
+        lastname=row.lastname,
+        email=row.email,
+        contact=row.contact,
+        dateofbirth=row.dateofbirth,
+        gender=row.gender,
+        pastmuns=[
+            models.MunExperience(
+                name=e.name,
+                committee=e.committee,
+                delegation=e.delegation,
+                year=e.year,
+                award=e.award,
+            )
+            for e in row.experiences
+        ],
+        verified=row.verified,
+    )
+
+
+def _to_delegate(row: db.DelegateRow) -> models.Delegate:
+    return models.Delegate(**_delegate_fields(row))
+
+
+def _to_mm_delegate(row: db.DelegateRow) -> models.MMDelegate:
+    """Needs row.experiences and row.mm loaded."""
+    mm = row.mm
+    return models.MMDelegate(
+        **_delegate_fields(row),
+        country=mm.country,
+        committee=mm.committee,
+        **{field: getattr(mm, field) for field in MEAL_FIELDS},
+    )
+
+
+def _apply_delegate(row: db.DelegateRow, delegate: models.Delegate) -> None:
+    row.firstname = delegate.firstname
+    row.lastname = delegate.lastname
+    row.email = delegate.email
+    row.contact = delegate.contact
+    row.dateofbirth = delegate.dateofbirth
+    row.gender = delegate.gender
+    row.verified = delegate.verified
+
+
+_WITH_EXPERIENCES = selectinload(db.DelegateRow.experiences)
 
 
 ####################
@@ -126,52 +95,139 @@ def get_admin_by_email(email: str) -> models.Admin | None:
 ####################
 
 
-def add_user(user: models.User) -> models.User:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute(
-            """INSERT INTO users
-            (email, password)
-            VALUES (?, ?)""",
-            (user.email, user.password),
-        )
-        connection.commit()
+async def add_user(user: models.User) -> models.User:
+    async with db.SessionLocal() as session, session.begin():
+        session.add(db.UserRow(email=user.email, password=user.password))
     return user
 
 
-def get_user_by_email(email: str) -> models.User | None:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if row:
-            password = row[1]
-            cursor.execute("SELECT * FROM delegates WHERE email = ?", (email,))
-            row = cursor.fetchone()
-            if row:
-                return models.User(
-                    firstname=row[1], lastname=row[2], email=row[3], password=password
-                )
-            else:
-                return None
-        else:
-            return None
-
-
-def change_user_pass(email: models.EmailStr, password: str):
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute(
-            "UPDATE users SET password = ? WHERE email = ?", (password, email)
+async def get_user_by_email(email: str) -> models.User | None:
+    async with db.SessionLocal() as session:
+        result = await session.execute(
+            select(db.UserRow.password, db.DelegateRow)
+            .join(db.DelegateRow, db.DelegateRow.email == db.UserRow.email)
+            .where(db.UserRow.email == email)
+            .options(selectinload(db.DelegateRow.experiences))
         )
-        connection.commit()
+        found = result.first()
+        if found is None:
+            return None
+        password, delegate = found
+        return models.User(
+            firstname=delegate.firstname,
+            lastname=delegate.lastname,
+            email=delegate.email,
+            password=password,
+        )
 
 
-def delete_user(email: models.EmailStr):
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("DELETE FROM users WHERE email = ?", (email,))
-        connection.commit()
+async def get_role(email: str) -> models.Role | None:
+    async with db.SessionLocal() as session:
+        return await session.scalar(select(db.UserRow.role).where(db.UserRow.email == email))
+
+
+async def get_auth_user(email: str) -> models.AuthUser | None:
+    """The delegate profile and role of the user with this email, or None if there is
+    no such user. Called on every authenticated request."""
+    async with db.SessionLocal() as session:
+        result = await session.execute(
+            select(db.DelegateRow, db.UserRow.role)
+            .join(db.UserRow, db.UserRow.email == db.DelegateRow.email)
+            .where(db.DelegateRow.email == email)
+            .options(_WITH_EXPERIENCES)
+        )
+        found = result.first()
+        if found is None:
+            return None
+        delegate, role = found
+        return models.AuthUser(**_delegate_fields(delegate), role=role)
+
+
+async def change_user_pass(email: models.EmailStr, password: str) -> None:
+    async with db.SessionLocal() as session, session.begin():
+        await session.execute(
+            update(db.UserRow).where(db.UserRow.email == email).values(password=password)
+        )
+
+
+async def delete_user(email: models.EmailStr) -> None:
+    async with db.SessionLocal() as session, session.begin():
+        user = await session.get(db.UserRow, email)
+        if user is not None:
+            await session.delete(user)
+
+
+####################
+# ROLES
+####################
+
+
+async def set_role(actor_email: str, target_email: str, new_role: str) -> str:
+    """Change target's role and record it in the audit table. Returns the old role.
+
+    Raises ValueError (unknown role), PermissionError (actor is not an admin, is
+    changing their own role, or this would remove the last admin) or LookupError
+    (no such user).
+    """
+    if new_role not in db.ROLES:
+        raise ValueError(f"Unknown role: {new_role}")
+    if actor_email == target_email:
+        raise PermissionError("You cannot change your own role")
+
+    async with db.SessionLocal() as session, session.begin():
+        # Lock every admin row (in a fixed order, so concurrent calls cannot deadlock)
+        # and re-check the actor inside the transaction: two admins demoting each
+        # other at the same moment must not leave the system with zero admins.
+        admins = (
+            await session.scalars(
+                select(db.UserRow.email)
+                .where(db.UserRow.role == "admin")
+                .order_by(db.UserRow.email)
+                .with_for_update()
+            )
+        ).all()
+        if actor_email not in admins:
+            raise PermissionError("Only admins can change roles")
+
+        target = await session.get(db.UserRow, target_email, with_for_update=True)
+        if target is None:
+            raise LookupError("User not found")
+        if target.role == "admin" and new_role != "admin" and len(admins) <= 1:
+            raise PermissionError("You cannot demote the last admin")
+
+        old_role = target.role
+        if old_role != new_role:
+            target.role = new_role
+            session.add(
+                db.AdminAuditRow(
+                    actor_email=actor_email,
+                    target_email=target_email,
+                    old_role=old_role,
+                    new_role=new_role,
+                )
+            )
+        return old_role
+
+
+async def make_admin(email: str) -> str:
+    """Bootstrap path for the first admin, used by the command line below. Returns the
+    old role. Raises LookupError if there is no user with this email."""
+    async with db.SessionLocal() as session, session.begin():
+        user = await session.get(db.UserRow, email, with_for_update=True)
+        if user is None:
+            raise LookupError(f"No user with email {email}. Register the account first.")
+        old_role = user.role
+        if old_role != "admin":
+            user.role = "admin"
+            session.add(
+                db.AdminAuditRow(
+                    actor_email="system:cli",
+                    target_email=email,
+                    old_role=old_role,
+                    new_role="admin",
+                )
+            )
+        return old_role
 
 
 ####################
@@ -179,442 +235,137 @@ def delete_user(email: models.EmailStr):
 ####################
 
 
-def add_delegate(delegate: models.Delegate) -> models.Delegate:
-    pastmuns = ""
-    for mun in delegate.pastmuns:
-        pastmuns += (
-            mun.name
-            + ","
-            + mun.committee
-            + ","
-            + mun.delegation
-            + ","
-            + str(mun.year)
-            + ","
-            + mun.award
-            + ";"
-        )
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute(
-            """INSERT INTO delegates
-                       (id, firstname, lastname, email, contact, dateofbirth, gender, pastmuns, verified)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                delegate.id,
-                delegate.firstname,
-                delegate.lastname,
-                delegate.email,
-                delegate.contact,
-                delegate.dateofbirth,
-                delegate.gender,
-                pastmuns,
-                delegate.verified,
-            ),
-        )
-        connection.commit()
+async def add_delegate(delegate: models.Delegate) -> models.Delegate:
+    row = db.DelegateRow(
+        id=delegate.id,
+        firstname=delegate.firstname,
+        lastname=delegate.lastname,
+        email=delegate.email,
+        contact=delegate.contact,
+        dateofbirth=delegate.dateofbirth,
+        gender=delegate.gender,
+        verified=delegate.verified,
+        experiences=_experience_rows(delegate.pastmuns),
+    )
+    async with db.SessionLocal() as session, session.begin():
+        session.add(row)
     return delegate
 
 
-def get_delegates() -> list[models.Delegate]:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM delegates")
-        rows = cursor.fetchall()
-        delegates = []
-        for row in rows:
-            mun_list = []
-            if row[7] != "":
-                muns = row[7].split(";")
-                for mun in muns:
-                    m = mun.split(",")
-                    if m != [""]:
-                        mun_list.append(
-                            models.MunExperience(
-                                name=m[0],
-                                committee=m[1],
-                                delegation=m[2],
-                                year=int(m[3]),
-                                award=m[4],
-                            )
-                        )
-            delegate = models.Delegate(
-                id=row[0],
-                firstname=row[1],
-                lastname=row[2],
-                email=row[3],
-                contact=row[4],
-                dateofbirth=row[5],
-                gender=row[6],
-                pastmuns=mun_list,
-                verified=row[8],
-            )
-            delegates.append(delegate)
-        return delegates
-
-
-def get_delegate_by_id(id: str) -> models.Delegate | None:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM delegates WHERE id = ?", (id,))
-        row = cursor.fetchone()
-        if row:
-            mun_list = []
-            if row[7] != "":
-                muns = row[7].split(";")
-                for mun in muns:
-                    m = mun.split(",")
-                    if m != [""]:
-                        mun_list.append(
-                            models.MunExperience(
-                                name=m[0],
-                                committee=m[1],
-                                delegation=m[2],
-                                year=int(m[3]),
-                                award=m[4],
-                            )
-                        )
-            return models.Delegate(
-                id=row[0],
-                firstname=row[1],
-                lastname=row[2],
-                email=row[3],
-                contact=row[4],
-                dateofbirth=row[5],
-                gender=row[6],
-                pastmuns=mun_list,
-                verified=row[8],
-            )
-        else:
-            return None
-
-
-def get_delegate_by_email(email: models.EmailStr) -> models.Delegate | None:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM delegates WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if row:
-            mun_list = []
-            if row[7] != "":
-                muns = row[7].split(";")
-                for mun in muns:
-                    m = mun.split(",")
-                    if m != [""]:
-                        mun_list.append(
-                            models.MunExperience(
-                                name=m[0],
-                                committee=m[1],
-                                delegation=m[2],
-                                year=int(m[3]),
-                                award=m[4],
-                            )
-                        )
-            return models.Delegate(
-                id=row[0],
-                firstname=row[1],
-                lastname=row[2],
-                email=row[3],
-                contact=row[4],
-                dateofbirth=row[5],
-                gender=row[6],
-                pastmuns=mun_list,
-                verified=row[8],
-            )
-        else:
-            return None
-
-
-def update_delegate_by_id(id: str, delegate: models.Delegate) -> models.Delegate:
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        pastmuns = ""
-        for mun in delegate.pastmuns:
-            pastmuns += (
-                mun.name
-                + ","
-                + mun.committee
-                + ","
-                + mun.delegation
-                + ","
-                + str(mun.year)
-                + ","
-                + mun.award
-                + ";"
-            )
-        cursor.execute(
-            """UPDATE delegates
-                       SET firstname = ?, lastname = ?, email = ?, contact = ?, dateofbirth = ?, gender = ?, pastmuns = ?, verified = ?
-                       WHERE id = ?""",
-            (
-                delegate.firstname,
-                delegate.lastname,
-                delegate.email,
-                delegate.contact,
-                delegate.dateofbirth,
-                delegate.gender,
-                pastmuns,
-                delegate.verified,
-                id,
-            ),
+async def get_delegates() -> list[models.Delegate]:
+    async with db.SessionLocal() as session:
+        rows = await session.scalars(
+            select(db.DelegateRow)
+            .options(_WITH_EXPERIENCES)
+            .order_by(db.DelegateRow.created_at, db.DelegateRow.id)
         )
-        connection.commit()
-        return delegate
+        return [_to_delegate(row) for row in rows]
 
 
-def verify_delegate_email(email: models.EmailStr):
-    with sqlite3.connect(db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("UPDATE delegates SET verified = 1 WHERE email = ?", (email,))
+async def get_delegate_by_id(id: str) -> models.Delegate | None:
+    async with db.SessionLocal() as session:
+        row = await session.scalar(
+            select(db.DelegateRow).where(db.DelegateRow.id == id).options(_WITH_EXPERIENCES)
+        )
+        return _to_delegate(row) if row else None
+
+
+async def get_delegate_by_email(email: models.EmailStr) -> models.Delegate | None:
+    async with db.SessionLocal() as session:
+        row = await session.scalar(
+            select(db.DelegateRow)
+            .where(db.DelegateRow.email == email)
+            .options(_WITH_EXPERIENCES)
+        )
+        return _to_delegate(row) if row else None
+
+
+async def update_delegate_by_id(id: str, delegate: models.Delegate) -> models.Delegate:
+    async with db.SessionLocal() as session, session.begin():
+        row = await session.scalar(
+            select(db.DelegateRow).where(db.DelegateRow.id == id).options(_WITH_EXPERIENCES)
+        )
+        if row is not None:
+            _apply_delegate(row, delegate)
+            row.experiences = _experience_rows(delegate.pastmuns)
+    return delegate
+
+
+async def verify_delegate_email(email: models.EmailStr) -> None:
+    async with db.SessionLocal() as session, session.begin():
+        await session.execute(
+            update(db.DelegateRow).where(db.DelegateRow.email == email).values(verified=True)
+        )
 
 
 ####################
-# MM DELEGATE FUNCTIONS
+# MM DELEGATES
 ####################
+# An MM delegate is a delegate (same id) plus a mm_delegates row. The profile fields
+# live only in delegates; the mm_delegates row holds country, committee and meals.
 
 
-def add_mm_delegate(mm_delegate: models.MMDelegate) -> models.MMDelegate:
-    pastmuns = ""
-    for mun in mm_delegate.pastmuns:
-        pastmuns += (
-            mun.name
-            + ","
-            + mun.committee
-            + ","
-            + mun.delegation
-            + ","
-            + str(mun.year)
-            + ","
-            + mun.award
-            + ";"
+def _mm_query():
+    return (
+        select(db.DelegateRow)
+        .join(db.DelegateRow.mm)
+        .options(contains_eager(db.DelegateRow.mm), _WITH_EXPERIENCES)
+    )
+
+
+async def add_mm_delegate(mm_delegate: models.MMDelegate) -> models.MMDelegate:
+    """The delegate with this id must already exist."""
+    async with db.SessionLocal() as session, session.begin():
+        session.add(
+            db.MMDelegateRow(
+                delegate_id=mm_delegate.id,
+                country=mm_delegate.country,
+                committee=mm_delegate.committee,
+                **{field: getattr(mm_delegate, field) for field in MEAL_FIELDS},
+            )
         )
-    with sqlite3.connect(mm_db) as connection:
-        cursor = connection.cursor()
-        cursor.execute(
-            """INSERT INTO mm_delegates(id, firstname, lastname, email, contact, dateofbirth, gender, pastmuns, verified, country, committee, d1_bf, d1_lunch, d1_hitea, d2_bf, d2_lunch, d2_hitea, d3_bf, d3_lunch, d3_hitea) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                mm_delegate.id,
-                mm_delegate.firstname,
-                mm_delegate.lastname,
-                mm_delegate.email,
-                mm_delegate.contact,
-                mm_delegate.dateofbirth,
-                mm_delegate.gender,
-                pastmuns,
-                mm_delegate.verified,
-                mm_delegate.country,
-                mm_delegate.committee,
-                mm_delegate.d1_bf,
-                mm_delegate.d1_lunch,
-                mm_delegate.d1_hitea,
-                mm_delegate.d2_bf,
-                mm_delegate.d2_lunch,
-                mm_delegate.d2_hitea,
-                mm_delegate.d3_bf,
-                mm_delegate.d3_lunch,
-                mm_delegate.d3_hitea,
-            ),
-        )
-        connection.commit()
     return mm_delegate
 
 
-def get_mm_delegates() -> list[models.MMDelegate]:
-    with sqlite3.connect(mm_db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM mm_delegates")
-        rows = cursor.fetchall()
-        delegates = []
-        for row in rows:
-            mun_list = []
-            if row[7] != "":
-                muns = row[7].split(";")
-                for mun in muns:
-                    m = mun.split(",")
-                    if m != [""]:
-                        mun_list.append(
-                            models.MunExperience(
-                                name=m[0],
-                                committee=m[1],
-                                delegation=m[2],
-                                year=int(m[3]),
-                                award=m[4],
-                            )
-                        )
-            delegate = models.MMDelegate(
-                id=row[0],
-                firstname=row[1],
-                lastname=row[2],
-                email=row[3],
-                contact=row[4],
-                dateofbirth=row[5],
-                gender=row[6],
-                pastmuns=mun_list,
-                verified=row[8],
-                country=row[9],
-                committee=row[10],
-                d1_bf=bool(row[11]),
-                d1_lunch=bool(row[12]),
-                d1_hitea=bool(row[13]),
-                d2_bf=bool(row[14]),
-                d2_lunch=bool(row[15]),
-                d2_hitea=bool(row[16]),
-                d3_bf=bool(row[17]),
-                d3_lunch=bool(row[18]),
-                d3_hitea=bool(row[19]),
-            )
-            delegates.append(delegate)
-        return delegates
+async def get_mm_delegates() -> list[models.MMDelegate]:
+    async with db.SessionLocal() as session:
+        rows = await session.scalars(
+            _mm_query().order_by(db.DelegateRow.created_at, db.DelegateRow.id)
+        )
+        return [_to_mm_delegate(row) for row in rows]
 
 
-def get_mm_delegate_by_id(id: str) -> models.MMDelegate | None:
-    with sqlite3.connect(mm_db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM mm_delegates WHERE id = ?", (id,))
-        row = cursor.fetchone()
-        if row:
-            mun_list = []
-            if row[7] != "":
-                muns = row[7].split(";")
-                for mun in muns:
-                    m = mun.split(",")
-                    if m != [""]:
-                        mun_list.append(
-                            models.MunExperience(
-                                name=m[0],
-                                committee=m[1],
-                                delegation=m[2],
-                                year=int(m[3]),
-                                award=m[4],
-                            )
-                        )
-            return models.MMDelegate(
-                id=row[0],
-                firstname=row[1],
-                lastname=row[2],
-                email=row[3],
-                contact=row[4],
-                dateofbirth=row[5],
-                gender=row[6],
-                pastmuns=mun_list,
-                verified=row[8],
-                country=row[9],
-                committee=row[10],
-                d1_bf=bool(row[11]),
-                d1_lunch=bool(row[12]),
-                d1_hitea=bool(row[13]),
-                d2_bf=bool(row[14]),
-                d2_lunch=bool(row[15]),
-                d2_hitea=bool(row[16]),
-                d3_bf=bool(row[17]),
-                d3_lunch=bool(row[18]),
-                d3_hitea=bool(row[19]),
-            )
-        return None
+async def get_mm_delegate_by_id(id: str) -> models.MMDelegate | None:
+    async with db.SessionLocal() as session:
+        row = await session.scalar(_mm_query().where(db.DelegateRow.id == id))
+        return _to_mm_delegate(row) if row else None
 
 
-def get_mm_delegate_by_email(email: str) -> models.MMDelegate | None:
-    with sqlite3.connect(mm_db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("SELECT * FROM mm_delegates WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if row:
-            mun_list = []
-            if row[7] != "":
-                muns = row[7].split(";")
-                for mun in muns:
-                    m = mun.split(",")
-                    if m != [""]:
-                        mun_list.append(
-                            models.MunExperience(
-                                name=m[0],
-                                committee=m[1],
-                                delegation=m[2],
-                                year=int(m[3]),
-                                award=m[4],
-                            )
-                        )
-            return models.MMDelegate(
-                id=row[0],
-                firstname=row[1],
-                lastname=row[2],
-                email=row[3],
-                contact=row[4],
-                dateofbirth=row[5],
-                gender=row[6],
-                pastmuns=mun_list,
-                verified=row[8],
-                country=row[9],
-                committee=row[10],
-                d1_bf=bool(row[11]),
-                d1_lunch=bool(row[12]),
-                d1_hitea=bool(row[13]),
-                d2_bf=bool(row[14]),
-                d2_lunch=bool(row[15]),
-                d2_hitea=bool(row[16]),
-                d3_bf=bool(row[17]),
-                d3_lunch=bool(row[18]),
-                d3_hitea=bool(row[19]),
-            )
-        return None
+async def get_mm_delegate_by_email(email: str) -> models.MMDelegate | None:
+    async with db.SessionLocal() as session:
+        row = await session.scalar(_mm_query().where(db.DelegateRow.email == email))
+        return _to_mm_delegate(row) if row else None
 
 
-def update_mm_delegate(id: str, mm_delegate: models.MMDelegate) -> models.MMDelegate:
-    try:
-        with sqlite3.connect(mm_db) as connection:
-            pastmuns = ""
-            for mun in mm_delegate.pastmuns:
-                pastmuns += (
-                    mun.name
-                    + ","
-                    + mun.committee
-                    + ","
-                    + mun.delegation
-                    + ","
-                    + str(mun.year)
-                    + ","
-                    + mun.award
-                    + ";"
-                )
-
-            cursor = connection.cursor()
-            cursor.execute(
-                """UPDATE mm_delegates SET firstname = ?, lastname = ?, email = ?, contact = ?, dateofbirth = ?, gender = ?, pastmuns = ?, verified = ?, country = ?, committee = ?, d1_bf = ?, d1_lunch = ?, d1_hitea = ?, d2_bf = ?, d2_lunch = ?, d2_hitea = ?, d3_bf = ?, d3_lunch = ?, d3_hitea = ? WHERE id = ?""",
-                (
-                    mm_delegate.firstname,
-                    mm_delegate.lastname,
-                    mm_delegate.email,
-                    mm_delegate.contact,
-                    mm_delegate.dateofbirth,
-                    mm_delegate.gender,
-                    pastmuns,
-                    mm_delegate.verified,
-                    mm_delegate.country,
-                    mm_delegate.committee,
-                    mm_delegate.d1_bf,
-                    mm_delegate.d1_lunch,
-                    mm_delegate.d1_hitea,
-                    mm_delegate.d2_bf,
-                    mm_delegate.d2_lunch,
-                    mm_delegate.d2_hitea,
-                    mm_delegate.d3_bf,
-                    mm_delegate.d3_lunch,
-                    mm_delegate.d3_hitea,
-                    id,
-                ),
-            )
-            connection.commit()
-        return mm_delegate
-    except Exception as e:
-        print(e)
-        return mm_delegate
+async def update_mm_delegate(id: str, mm_delegate: models.MMDelegate) -> models.MMDelegate:
+    """Updates only the Mumbai MUN fields (country, committee, meals). Profile fields
+    are changed through update_delegate_by_id."""
+    async with db.SessionLocal() as session, session.begin():
+        row = await session.get(db.MMDelegateRow, id)
+        if row is not None:
+            row.country = mm_delegate.country
+            row.committee = mm_delegate.committee
+            for field in MEAL_FIELDS:
+                setattr(row, field, getattr(mm_delegate, field))
+    return mm_delegate
 
 
-def delete_mm_delegate(id: str):
-    with sqlite3.connect(mm_db) as connection:
-        cursor = connection.cursor()
-        cursor.execute("DELETE FROM mm_delegates WHERE id = ?", (id,))
-        connection.commit()
+async def delete_mm_delegate(id: str) -> None:
+    """Removes the Mumbai MUN registration; the delegate profile stays."""
+    async with db.SessionLocal() as session, session.begin():
+        row = await session.get(db.MMDelegateRow, id)
+        if row is not None:
+            await session.delete(row)
 
 
 ####################
@@ -622,17 +373,58 @@ def delete_mm_delegate(id: str):
 ####################
 
 
-def backup_database():
-    with sqlite3.connect(db) as connection:
-        with sqlite3.connect(backup_db) as b_conn:
-            connection.backup(b_conn)
+async def backup_database() -> str:
+    """Runs pg_dump (custom format, already compressed; restore with pg_restore) into
+    BACKUP_DIR and returns the file path. Needs pg_dump 16 or newer on PATH."""
+    settings = config.get_settings()
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"mundra-ondemand-{stamp}.dump")
 
-    with sqlite3.connect(mm_db) as mm_connection:
-        with sqlite3.connect(mm_backup_db) as mm_b_conn:
-            mm_connection.backup(mm_b_conn)
+    process = await asyncio.create_subprocess_exec(
+        "pg_dump",
+        "--format=custom",
+        "--file", path,
+        "--host", settings.postgres_host,
+        "--port", str(settings.postgres_port),
+        "--username", settings.postgres_user,
+        "--dbname", settings.postgres_db,
+        # The password goes in the environment, not argv, so it is not visible in `ps`.
+        env={**os.environ, "PGPASSWORD": settings.postgres_password},
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"pg_dump failed: {stderr.decode().strip()}")
+    return path
 
-    with zipfile.ZipFile(db_zip, "w") as z:
-        z.write(backup_db, arcname=os.path.basename(backup_db))
-        z.write(mm_backup_db, arcname=os.path.basename(mm_backup_db))
 
-    print("Both main and mm databases backed up and compressed successfully")
+####################
+# COMMAND LINE
+####################
+
+
+async def _cli(args: argparse.Namespace) -> int:
+    try:
+        if args.command == "make-admin":
+            old_role = await make_admin(args.email)
+            if old_role == "admin":
+                print(f"{args.email} is already an admin.")
+            else:
+                print(f"{args.email}: {old_role} -> admin")
+        return 0
+    except LookupError as e:
+        print(e)
+        return 1
+    finally:
+        await db.engine.dispose()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MUNDRA database commands")
+    commands = parser.add_subparsers(dest="command", required=True)
+    make_admin_parser = commands.add_parser(
+        "make-admin", help="Give an existing user the admin role (first-admin bootstrap)"
+    )
+    make_admin_parser.add_argument("email")
+    raise SystemExit(asyncio.run(_cli(parser.parse_args())))

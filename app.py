@@ -1,4 +1,6 @@
+import asyncio
 import csv
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from io import StringIO
 import os
@@ -20,10 +22,12 @@ from auth import (
     create_access_token,
     get_current_user,
     hash_password,
+    require_admin,
     verify_password,
 )
 import config
 import database
+import db
 import mails
 import models
 import utils
@@ -36,7 +40,14 @@ limiter = Limiter(key_func=get_remote_address)
 
 settings = config.get_settings()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await db.engine.dispose()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="MUNDRA - MUNSoc Delegate Resource Application",
     description="Named after Mundra Port, Kutch, Gujarat, MUNDRA - MUNSoc Delegate Resource Application is a centralized database designed to optimize event planning, streamline communication, and facilitate delegate management",
     version="1.0.0",
@@ -49,8 +60,6 @@ templates = Jinja2Templates(directory="templates")
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-database.init()
 
 
 @app.get("/", tags=["Status"])
@@ -76,16 +85,16 @@ def status():
 @limiter.limit("10/minute")
 async def register(request: Request, user: models.User):
     try:
-        user.password = hash_password(user.password)
+        user.password = await asyncio.to_thread(hash_password, user.password)
 
-        user_exists = database.get_user_by_email(user.email)
+        user_exists = await database.get_user_by_email(user.email)
         if user_exists:
             raise HTTPException(status_code=409, detail="User already exists")
 
-        delegate = database.get_delegate_by_email(user.email)
+        delegate = await database.get_delegate_by_email(user.email)
         if not delegate:
             uid = str(uuid.uuid4()).replace("-", "")
-            delegate = database.add_delegate(
+            delegate = await database.add_delegate(
                 models.Delegate(
                     id=uid,
                     firstname=user.firstname,
@@ -93,7 +102,7 @@ async def register(request: Request, user: models.User):
                     email=user.email,
                 )
             )
-        database.add_user(user)
+        await database.add_user(user)
 
         try:
             await mails.send_verification_email(delegate)
@@ -120,25 +129,20 @@ async def register(request: Request, user: models.User):
     },
 )
 @limiter.limit("10/minute")
-def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     email = form_data.username
     password = form_data.password
 
-    admin = database.get_admin_by_email(email)
-    if admin:
-        if not verify_password(password, admin.password):
-            raise HTTPException(status_code=401, detail="Invalid password")
-        access_token = create_access_token(data={"sub": admin.email, "type": "admin"})
-        return models.Token(access_token=access_token, token_type="bearer", user_type="admin")
-
-    user = database.get_user_by_email(email)
+    user = await database.get_user_by_email(email)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email")
-    if not verify_password(password, user.password):
+    if not await asyncio.to_thread(verify_password, password, user.password):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    access_token = create_access_token(data={"sub": user.email, "type": "user"})
-    return models.Token(access_token=access_token, token_type="bearer", user_type="user")
+    # user_type keeps the two values the app already understands; "oc" reports as "user".
+    user_type = "admin" if await database.get_role(user.email) == "admin" else "user"
+    access_token = create_access_token(data={"sub": user.email, "type": user_type})
+    return models.Token(access_token=access_token, token_type="bearer", user_type=user_type)
 
 
 @app.get(
@@ -153,7 +157,7 @@ async def verify_email(request: Request, token: str):
         delegate = await check_verification_token(token)
         if type(delegate) != models.Delegate:
             raise HTTPException(status_code=401, detail="Invalid token")
-        database.verify_delegate_email(delegate.email)
+        await database.verify_delegate_email(delegate.email)
         return JSONResponse(status_code=200, content={"message": "Email verified!"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -171,7 +175,7 @@ async def verify_email(request: Request, token: str):
 @limiter.limit("10/minute")
 async def resend_verification_email(request: Request, email: models.EmailStr):
     try:
-        delegate = database.get_delegate_by_email(email)
+        delegate = await database.get_delegate_by_email(email)
         if not delegate:
             raise HTTPException(status_code=404, detail="Delegate not found")
         if delegate.verified:
@@ -197,7 +201,7 @@ async def resend_verification_email(request: Request, email: models.EmailStr):
 @limiter.limit("1/minute")
 async def forgot_password(request: Request, email: models.EmailStr):
     try:
-        delegate = database.get_delegate_by_email(email)
+        delegate = await database.get_delegate_by_email(email)
         if not delegate:
             raise HTTPException(status_code=404, detail="User not found")
         if not delegate.verified:
@@ -222,18 +226,18 @@ async def forgot_password(request: Request, email: models.EmailStr):
     },
 )
 @limiter.limit("1/minute")
-def change_password(
+async def change_password(
     request: Request,
     password: str,
-    delegate: models.Delegate | models.Admin = Depends(get_current_user),
+    delegate: models.AuthUser = Depends(get_current_user),
 ):
     try:
-        if type(delegate) != models.Delegate:
-            raise HTTPException(status_code=403, detail="Forbidden")
-        user = database.get_user_by_email(delegate.email)
+        user = await database.get_user_by_email(delegate.email)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        database.change_user_pass(user.email, hash_password(password))
+        await database.change_user_pass(
+            user.email, await asyncio.to_thread(hash_password, password)
+        )
         return JSONResponse(status_code=200, content={"message": "Password changed!"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -263,17 +267,39 @@ def get_hashed_password(password: str) -> str:
         500: {"model": models.ErrorResponse},
     },
 )
-def backup_database(user: models.Delegate | models.Admin = Depends(get_current_user)):
+async def backup_database(user: models.AuthUser = Depends(require_admin)):
+    """Runs pg_dump now and returns the dump (restore it with pg_restore)."""
     try:
-        if type(user) != models.Admin:
-            raise HTTPException(status_code=403, detail="Forbidden")
-        database.backup_database()
+        path = await database.backup_database()
         return FileResponse(
-            os.path.join(os.path.dirname(__file__), "backups", "backup_db.zip"),
-            media_type="application/zip",
+            path, media_type="application/octet-stream", filename=os.path.basename(path)
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch(
+    "/admin/users/{email}/role",
+    tags=["Admin"],
+    responses={
+        403: {"model": models.ErrorResponse},
+        404: {"model": models.ErrorResponse},
+    },
+)
+async def change_role(
+    email: models.EmailStr,
+    change: models.RoleChange,
+    admin: models.AuthUser = Depends(require_admin),
+):
+    """Give a user the delegate, oc or admin role. Every change is written to the
+    admin_audit table."""
+    try:
+        old_role = await database.set_role(admin.email, email, change.role)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    return {"email": email, "old_role": old_role, "new_role": change.role}
 
 
 @app.get(
@@ -289,9 +315,9 @@ def backup_database(user: models.Delegate | models.Admin = Depends(get_current_u
 async def get_delegates(token: str = "", format: str = ""):
     try:
         user = await get_current_user(token)
-        if type(user) != models.Admin:
+        if user.role != "admin":
             raise HTTPException(status_code=403, detail="Forbidden")
-        data = database.get_delegates()
+        data = await database.get_delegates()
         if data:
             if format == "csv":
                 output = StringIO()
@@ -350,15 +376,8 @@ async def get_delegates(token: str = "", format: str = ""):
     response_model=models.Delegate,
     responses={500: {"model": models.ErrorResponse}},
 )
-def get_current_delegate(
-    user: models.Delegate | models.Admin = Depends(get_current_user),
-):
-    try:
-        if type(user) == models.Admin:
-            raise HTTPException(status_code=500, detail="You are an admin")
-        return user
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def get_current_delegate(user: models.AuthUser = Depends(get_current_user)):
+    return user
 
 
 @app.get(
@@ -371,15 +390,15 @@ def get_current_delegate(
         500: {"model": models.ErrorResponse},
     },
 )
-def get_delegate_by_id(
-    id: str, user: models.Delegate | models.Admin = Depends(get_current_user)
+async def get_delegate_by_id(
+    id: str, user: models.AuthUser = Depends(get_current_user)
 ):
     try:
-        if type(user) != models.Admin:
-            if type(user) == models.Delegate and user.id == id:
+        if user.role != "admin":
+            if user.id == id:
                 return user
             raise HTTPException(status_code=403, detail="Forbidden")
-        data = database.get_delegate_by_id(id)
+        data = await database.get_delegate_by_id(id)
         if data:
             return data
         raise HTTPException(status_code=404, detail="Delegate not found")
@@ -397,9 +416,9 @@ def get_delegate_by_id(
         500: {"model": models.ErrorResponse},
     },
 )
-def update_delegate(
+async def update_delegate(
     id: str,
-    user: models.Delegate | models.Admin = Depends(get_current_user),
+    user: models.AuthUser = Depends(get_current_user),
     firstname: str = "",
     lastname: str = "",
     contact: str = "",
@@ -409,10 +428,9 @@ def update_delegate(
     verified: bool = False,
 ):
     try:
-        if type(user) != models.Admin:
-            if type(user) == models.Delegate and user.id != id:
-                raise HTTPException(status_code=403, detail="Forbidden")
-        data = database.get_delegate_by_id(id)
+        if user.role != "admin" and user.id != id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        data = await database.get_delegate_by_id(id)
         if not data:
             raise HTTPException(status_code=404, detail="Delegate not found")
         if firstname != "":
@@ -429,7 +447,7 @@ def update_delegate(
             data.pastmuns = pastmuns
         if verified:
             data.verified = verified
-        return database.update_delegate_by_id(id, data)
+        return await database.update_delegate_by_id(id, data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -474,11 +492,11 @@ mm_router = APIRouter(prefix="/mumbaimun", tags=["Mumbai MUN"])
 )
 async def mm_register(request: Request, user: models.User):
     try:
-        user.password = hash_password(user.password)
-        user_exists = database.get_user_by_email(user.email)
+        user.password = await asyncio.to_thread(hash_password, user.password)
+        user_exists = await database.get_user_by_email(user.email)
 
         if user_exists:
-            delegate = database.get_delegate_by_email(user.email)
+            delegate = await database.get_delegate_by_email(user.email)
 
             if not delegate:
                 raise HTTPException(
@@ -486,9 +504,9 @@ async def mm_register(request: Request, user: models.User):
                 )
             if not delegate.verified:
                 delegate.verified = True
-                database.update_delegate_by_id(delegate.id, delegate)
+                await database.update_delegate_by_id(delegate.id, delegate)
 
-            mm_delegate = database.get_mm_delegate_by_email(user.email)
+            mm_delegate = await database.get_mm_delegate_by_email(user.email)
 
             if mm_delegate:
                 raise HTTPException(
@@ -496,7 +514,7 @@ async def mm_register(request: Request, user: models.User):
                     detail=f"Mumbai MUN Delegate already registered! ID: {mm_delegate.id}",
                 )
 
-            mm_delegate = database.add_mm_delegate(
+            mm_delegate = await database.add_mm_delegate(
                 models.MMDelegate(
                     id=delegate.id,
                     firstname=delegate.firstname,
@@ -519,10 +537,10 @@ async def mm_register(request: Request, user: models.User):
 
         else:
 
-            delegate = database.get_delegate_by_email(user.email)
+            delegate = await database.get_delegate_by_email(user.email)
             if not delegate:
                 uid = str(uuid.uuid4()).replace("-", "")
-                delegate = database.add_delegate(
+                delegate = await database.add_delegate(
                     models.Delegate(
                         id=uid,
                         firstname=user.firstname,
@@ -532,13 +550,13 @@ async def mm_register(request: Request, user: models.User):
                     )
                 )
 
-            database.add_user(user)
+            await database.add_user(user)
 
             if not delegate.verified:
                 delegate.verified = True
-                database.update_delegate_by_id(delegate.id, delegate)
+                await database.update_delegate_by_id(delegate.id, delegate)
 
-            mm_delegate = database.add_mm_delegate(
+            mm_delegate = await database.add_mm_delegate(
                 models.MMDelegate(
                     id=delegate.id,
                     firstname=delegate.firstname,
@@ -578,13 +596,10 @@ async def mm_register(request: Request, user: models.User):
     },
 )
 async def get_mm_delegates(
-    user: models.Delegate | models.Admin = Depends(get_current_user), format: str = ""
+    user: models.AuthUser = Depends(require_admin), format: str = ""
 ):
     try:
-        if type(user) != models.Admin:
-            raise HTTPException(status_code=403, detail="Forbidden")
-
-        data = database.get_mm_delegates()
+        data = await database.get_mm_delegates()
         if data:
             if format == "csv":
                 output = StringIO()
@@ -645,9 +660,9 @@ def scan(request: Request):
 
 
 @app.get("/food", tags=["Food"], response_class=HTMLResponse)
-def get_food(request: Request, id: str):
+async def get_food(request: Request, id: str):
     try:
-        delegate = database.get_mm_delegate_by_id(id)
+        delegate = await database.get_mm_delegate_by_id(id)
         if not delegate:
             raise HTTPException(status_code=404, detail="Delegate not found")
 
@@ -659,7 +674,7 @@ def get_food(request: Request, id: str):
 
 # Literally anyone in the wild can update this which is concerning, Will fix this later
 @app.post("/food", tags=["Food"], status_code=201)
-def update_food(
+async def update_food(
     id: Annotated[str, Form()],
     d1_bf: Annotated[bool, Form()] = True,
     d1_lunch: Annotated[bool, Form()] = False,
@@ -672,7 +687,7 @@ def update_food(
     d3_hitea: Annotated[bool, Form()] = False,
 ):
     # Fetch the existing delegate
-    delegate = database.get_mm_delegate_by_id(id)
+    delegate = await database.get_mm_delegate_by_id(id)
     if not delegate:
         raise HTTPException(status_code=404, detail="Delegate not found")
 
@@ -687,7 +702,7 @@ def update_food(
     delegate.d3_hitea = d3_hitea
 
     try:
-        database.update_mm_delegate(delegate.id, delegate)
+        await database.update_mm_delegate(delegate.id, delegate)
         return JSONResponse(
             status_code=201,
             content={"message": "Food updated successfully"},
@@ -702,14 +717,14 @@ def update_food(
 
 # again, anyone in the wild can bypass email verification, will fix later
 @app.post("/manual_verify", tags=["OC"], status_code=201)
-def manual_verify(email: str):
+async def manual_verify(email: str):
     try:
-        delegate = database.get_delegate_by_email(email)
+        delegate = await database.get_delegate_by_email(email)
         if not delegate:
             raise HTTPException(status_code=404, detail="Delegate not found")
 
         delegate.verified = True
-        database.update_delegate_by_id(delegate.id, delegate)
+        await database.update_delegate_by_id(delegate.id, delegate)
 
         return JSONResponse(status_code=201, content={"message": "Email verified!"})
     except Exception as e:
@@ -722,11 +737,14 @@ def manual_verify(email: str):
 
 
 @app.delete("/account", tags=["Auth"], status_code=200)
-def delete_user(user: models.Delegate | models.Admin = Depends(get_current_user)):
-    if type(user) != models.Delegate:
-        raise HTTPException(status_code=500, detail="You are an admin")
+async def delete_user(user: models.AuthUser = Depends(get_current_user)):
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Admins must be demoted before they can delete their account",
+        )
     try:
-        database.delete_user(user.email)
+        await database.delete_user(user.email)
         return JSONResponse(
             status_code=200, content={"message": "Account deleted successfully"}
         )
